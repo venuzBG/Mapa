@@ -1,0 +1,19 @@
+# Ignorar archivos temporales de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignorar entornos virtuales
+venv/
+ENV/
+env/
+outputs/
+.venv/
+.ENV/
+.env/
+
+# Ignorar carpetas de caché de Python
+__pycache__/
+
+# Ignorar todos los archivos compilados
+*.pyc
