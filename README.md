@@ -1,4 +1,4 @@
-# 🗻 Generación de Mapa 3D — Ecuador
+#  Generación de Mapa 3D — Ecuador
 
 <div align="center">
   <img src="assets/pic_mapa_3D.png" alt="Generación de mapa 3D - Grupo 4" width="400">
@@ -25,7 +25,7 @@ Lenin Vásquez
 
 ##  Tabla de contenidos
 
-- [🗻 Generación de Mapa 3D — Ecuador](#-generación-de-mapa-3d--ecuador)
+  - [Generación de Mapa 3D — Ecuador](#-generación-de-mapa-3d--ecuador)
   - [Objetivo](#objetivo)
   - [Tabla de contenidos](#tabla-de-contenidos)
   - [Descripción](#descripción)
