@@ -1,9 +1,8 @@
 import os
-import sys
-import math
 import struct
 import customtkinter as ctk
-from tkinter import messagebox, simpledialog, filedialog
+from tkinter import messagebox, filedialog
+from dialogs import ExportDialog
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,6 +14,7 @@ from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
 
 import geopandas as gpd
+
 
 
 # =========================
@@ -313,7 +313,6 @@ class EcuadorMapVisor(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="Zoom", command=self.enable_zoom).pack(pady=6, padx=25, fill="x")
         ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=self.enable_pan).pack(pady=6, padx=25, fill="x")
         ctk.CTkButton(self.sidebar, text="Seleccionar zona (rectángulo)", command=self.enable_rect_select).pack(pady=6, padx=25, fill="x")
-        ctk.CTkButton(self.sidebar, text="Recortar por coordenadas", command=self.crop_by_coordinates).pack(pady=6, padx=25, fill="x")
         ctk.CTkButton(self.sidebar, text="Exportar zona a STL (3D)", command=self.export_selected_to_stl).pack(pady=10, padx=25, fill="x")
 
         self.status_label = ctk.CTkLabel(self.sidebar, text="Estado: listo.", text_color="gray", font=("Arial", 11))
@@ -443,27 +442,12 @@ class EcuadorMapVisor(ctk.CTk):
         self.rect_selector.set_active(True)
         self.status_label.configure(text="Estado: selección activa. Arrastra un rectángulo en el mapa.")
 
-    def crop_by_coordinates(self):
-        msg = "Ingresa coordenadas en grados (EPSG:4326).\nEj: minLon=-80.5, minLat=-4.5, maxLon=-78.0, maxLat=-2.0"
-        messagebox.showinfo("Recorte por coordenadas", msg)
-
-        minx = simpledialog.askfloat("minLon", "minLon (ej -80.5):")
-        miny = simpledialog.askfloat("minLat", "minLat (ej -4.5):")
-        maxx = simpledialog.askfloat("maxLon", "maxLon (ej -78.0):")
-        maxy = simpledialog.askfloat("maxLat", "maxLat (ej -2.0):")
-
-        if None in (minx, miny, maxx, maxy):
-            return
-
-        self.selected_bounds = (min(minx, maxx), min(miny, maxy), max(minx, maxx), max(miny, maxy))
-        self.status_label.configure(text=f"Estado: zona por coords lista ({self.selected_bounds[0]:.3f},{self.selected_bounds[1]:.3f})-({self.selected_bounds[2]:.3f},{self.selected_bounds[3]:.3f})")
-
     # =========================
     # EXPORT STL (SÓLIDO)
     # =========================
     def export_selected_to_stl(self):
         if self.selected_bounds is None:
-            messagebox.showerror("Error", "Primero selecciona una zona (rectángulo o coordenadas).")
+            messagebox.showerror("Error", "Primero selecciona una zona con el rectángulo.")
             return
 
         if not os.path.exists(DEM_PATH):
@@ -473,22 +457,16 @@ class EcuadorMapVisor(ctk.CTk):
             messagebox.showerror("Falta GeoJSON", f"No existe:\n{BORDER_PATH}")
             return
 
-        # Parámetros (recomendados para que Bambu no sufra)
-        target = simpledialog.askinteger("Resolución", "Resolución objetivo (ej 300-600):", initialvalue=450, minvalue=100, maxvalue=1200)
-        if target is None:
-            return
+        dlg = ExportDialog(self)
+        self.wait_window(dlg)  # espera a que el usuario cierre el diálogo
 
-        base_mm = simpledialog.askfloat("Base", "Grosor de base (mm):", initialvalue=2.0, minvalue=0.5, maxvalue=20.0)
-        if base_mm is None:
-            return
+        if dlg.result is None:
+            return  # Canceló
 
-        height_mm = simpledialog.askfloat("Altura", "Altura del relieve (mm):", initialvalue=35.0, minvalue=5.0, maxvalue=200.0)
-        if height_mm is None:
-            return
-
-        cell_mm = simpledialog.askfloat("Escala XY", "Tamaño por celda (mm) (1.0 recomendado):", initialvalue=1.0, minvalue=0.2, maxvalue=5.0)
-        if cell_mm is None:
-            return
+        target = dlg.result["target"]
+        base_mm = dlg.result["base_mm"]
+        height_mm = dlg.result["height_mm"]
+        cell_mm = dlg.result["cell_mm"]
 
         out_path = filedialog.asksaveasfilename(
             defaultextension=".stl",

@@ -43,3 +43,4 @@ class LayerManager:
         self._cantons_gdf.boundary.plot(
             ax=ax, linewidth=0.6, color="#00E5FF", alpha=0.75, zorder=9
         )
+
