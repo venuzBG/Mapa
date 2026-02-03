@@ -24,8 +24,8 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 OUT_DIR = os.path.join(BASE_DIR, "outputs", "dem")
 
 # Archivos de Datos
-DEM_LIGERO_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif") # El que se ve (Rápido)
-DEM_FULL_PATH = os.path.join(OUT_DIR, "ecuador_full.tif")             # El original (Solo para leer info)
+DEM_LIGERO_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif") # El que se ve
+DEM_FULL_PATH = os.path.join(OUT_DIR, "ecuador_full.tif")             # El original
 
 BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")     
 PROVINCES_PATH = os.path.join(DATA_DIR, "provincias.geojson") 
@@ -39,20 +39,16 @@ ctk.set_default_color_theme("blue")
 # UTILIDADES GEOGRÁFICAS
 # =========================
 def load_ecuador_mainland_geometry(geojson_path: str):
-    """ Carga geometría limpia sin agujeros internos """
     try:
         gdf = gpd.read_file(geojson_path)
         geom = gdf.unary_union
-
         def drop_holes(geometry):
             if geometry.geom_type == 'Polygon':
                 return Polygon(geometry.exterior)
             elif geometry.geom_type == 'MultiPolygon':
                 return MultiPolygon([Polygon(p.exterior) for p in geometry.geoms])
             return geometry
-
         geom_clean = drop_holes(geom)
-
         if geom_clean.geom_type == "MultiPolygon":
             return max(list(geom_clean.geoms), key=lambda g: g.area)
         return geom_clean
@@ -153,6 +149,11 @@ class EcuadorMapVisor(ctk.CTk):
         self.selected_bounds = None
         self.rect_selector = None
         self.colorbar = None
+        
+        # Variables para resolución
+        self.orig_res_x = None
+        self.orig_res_y = None
+        
         self.setup_ui()
         self.load_full_map()
 
@@ -176,7 +177,11 @@ class EcuadorMapVisor(ctk.CTk):
         self.lbl_orig_dim.pack(anchor="w", padx=10)
         
         self.lbl_view_dim = ctk.CTkLabel(self.stats_frame, text="Visor: ...", font=("Consolas", 11))
-        self.lbl_view_dim.pack(anchor="w", padx=10, pady=(0, 5))
+        self.lbl_view_dim.pack(anchor="w", padx=10)
+
+        # ETIQUETA SELECCIÓN
+        self.lbl_sel_dim = ctk.CTkLabel(self.stats_frame, text="Selección: -", font=("Consolas", 11), text_color="#FFCC00")
+        self.lbl_sel_dim.pack(anchor="w", padx=10, pady=(5, 5))
 
         # --- BOTONES ---
         ctk.CTkButton(self.sidebar, text="Restablecer Vista", command=self.load_full_map).pack(pady=10, padx=20, fill="x")
@@ -194,6 +199,7 @@ class EcuadorMapVisor(ctk.CTk):
         self.map_frame = ctk.CTkFrame(self, fg_color="#1a1a1a")
         self.map_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         
+        # Figura inicial
         self.fig, self.ax = plt.subplots(figsize=(8,8), facecolor="#1a1a1a")
         self.ax.set_facecolor("black")
         self.ax.tick_params(colors="white")
@@ -207,41 +213,48 @@ class EcuadorMapVisor(ctk.CTk):
     def status(self, txt): self.status_lbl.configure(text=txt)
 
     def load_full_map(self):
-        if not os.path.exists(DEM_LIGERO_PATH): return messagebox.showerror("Error", "Falta DEM (Clipped).")
-        self.ax.clear()
-        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
-        self.ax.grid(False)
+        # 1. Limpiar herramientas
+        self.reset_tools()
+        self.rect_selector = None
+        
+        # 2. LIMPIEZA NUCLEAR DE LA FIGURA
+        # Borramos toda la figura (incluyendo ejes deformados) para evitar "deriva"
+        self.fig.clear()
+        self.colorbar = None # Olvidamos la colorbar vieja
 
+        # 3. CREAMOS UN EJE NUEVO LIMPIO (Posición 0,0)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor("black")
+        self.ax.tick_params(colors="white")
+        self.ax.grid(False)
+        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
+
+        if not os.path.exists(DEM_LIGERO_PATH): return messagebox.showerror("Error", "Falta DEM (Clipped).")
+        
+        # Cargar datos (igual que antes)
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
         
-        # -------------------------------------------------------------
-        # PASO 1: LEER INFORMACIÓN DEL ORIGINAL (SIN CARGARLO EN RAM)
-        # -------------------------------------------------------------
         orig_w, orig_h = 0, 0
         if os.path.exists(DEM_FULL_PATH):
             try:
-                # rasterio.open() solo lee el encabezado, es instantáneo
                 with rasterio.open(DEM_FULL_PATH) as src_full:
                     orig_w, orig_h = src_full.width, src_full.height
+                    self.orig_res_x = src_full.transform[0] 
+                    self.orig_res_y = -src_full.transform[4] 
             except: pass
         
-        # Si no existe el full, estimamos basado en el ligero (x10)
-        # Pero intentaremos mostrar los datos reales primero.
+        arr, transform = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, bounds)
         
-        # -------------------------------------------------------------
-        # PASO 2: CARGAR EL MAPA LIGERO (PARA VISUALIZAR)
-        # -------------------------------------------------------------
-        arr, _ = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, bounds)
-        
-        # Si no encontramos el original, usamos el ligero x10 como referencia visual
         if orig_w == 0:
-            orig_h, orig_w = arr.shape[0] * 10, arr.shape[1] * 10
+            orig_h = arr.shape[0] * 10
+            orig_w = arr.shape[1] * 10
+            self.orig_res_x = transform[0] / 10.0
+            self.orig_res_y = -transform[4] / 10.0
             
-        # ACTUALIZAR ETIQUETA "ORIGINAL"
         self.lbl_orig_dim.configure(text=f"Original: {orig_w} x {orig_h} px")
+        self.lbl_sel_dim.configure(text="Selección: -") 
         
-        # 3. Reducir para visualización en pantalla
         h, w = arr.shape
         scale = max(h,w)/800
         if scale > 1:
@@ -249,7 +262,6 @@ class EcuadorMapVisor(ctk.CTk):
         else:
             arr_disp = arr
             
-        # ACTUALIZAR ETIQUETA "VISOR"
         disp_h, disp_w = arr_disp.shape
         self.lbl_view_dim.configure(text=f"Visor:    {disp_w} x {disp_h} px")
         
@@ -265,13 +277,13 @@ class EcuadorMapVisor(ctk.CTk):
         self.ax.set_xlim(bounds[0], bounds[2])
         self.ax.set_ylim(bounds[1], bounds[3])
 
-        if self.colorbar: 
-            try: self.colorbar.remove()
-            except: pass
         self.colorbar = self.fig.colorbar(img, ax=self.ax, fraction=0.046, pad=0.04)
         self.colorbar.set_label("Altura [m]", color="white")
         self.colorbar.ax.yaxis.set_tick_params(color="white", labelcolor="white")
         self.colorbar.outline.set_edgecolor('white')
+
+        # FIX DE CENTRADO (Ahora sí funcionará perfecto porque la figura es nueva)
+        self.fig.tight_layout()
 
         self.canvas.draw()
         self.status("Mapa Continental Cargado.")
@@ -279,7 +291,14 @@ class EcuadorMapVisor(ctk.CTk):
     def reset_tools(self):
         if self.toolbar.mode == 'zoom rect': self.toolbar.zoom()
         elif self.toolbar.mode == 'pan/zoom': self.toolbar.pan()
-        if self.rect_selector: self.rect_selector.set_active(False)
+        
+        if self.rect_selector:
+            self.rect_selector.set_active(False)
+            try:
+                self.rect_selector.set_visible(False)
+            except: pass
+            
+            self.canvas.draw_idle()
 
     def enable_zoom(self):
         self.reset_tools()
@@ -293,10 +312,23 @@ class EcuadorMapVisor(ctk.CTk):
 
     def enable_rect_select(self):
         self.reset_tools()
+        
         def onselect(eclick, erelease):
             x1, y1, x2, y2 = eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata
-            self.selected_bounds = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
+            
+            minx, maxx = sorted([x1, x2])
+            miny, maxy = sorted([y1, y2])
+            self.selected_bounds = (minx, miny, maxx, maxy)
+            
+            if self.orig_res_x and self.orig_res_y:
+                width_deg = maxx - minx
+                height_deg = maxy - miny
+                px_w = int(width_deg / self.orig_res_x)
+                px_h = int(height_deg / self.orig_res_y)
+                self.lbl_sel_dim.configure(text=f"Selección: {px_w} x {px_h} px")
+            
             self.status("Zona seleccionada.")
+            
         self.rect_selector = RectangleSelector(self.ax, onselect, useblit=True, button=[1], interactive=True)
         self.rect_selector.set_active(True)
         self.status("Herramienta: Selección activa.")
