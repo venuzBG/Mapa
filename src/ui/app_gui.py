@@ -23,7 +23,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUT_DIR = os.path.join(BASE_DIR, "outputs", "dem")
 
-DEM_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif")
+# Archivos de Datos
+DEM_LIGERO_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif") # El que se ve (Rápido)
+DEM_FULL_PATH = os.path.join(OUT_DIR, "ecuador_full.tif")             # El original (Solo para leer info)
+
 BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")     
 PROVINCES_PATH = os.path.join(DATA_DIR, "provincias.geojson") 
 CANTONES_PATH = os.path.join(DATA_DIR, "cantones.geojson")   
@@ -160,7 +163,22 @@ class EcuadorMapVisor(ctk.CTk):
         self.sidebar = ctk.CTkFrame(self, width=300, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         
-        ctk.CTkLabel(self.sidebar, text="CONTROLES", font=("Arial", 20, "bold")).pack(pady=20)
+        # --- TÍTULO ---
+        ctk.CTkLabel(self.sidebar, text="CONTROLES", font=("Arial", 20, "bold")).pack(pady=(20, 10))
+        
+        # --- SECCIÓN DE ESTADÍSTICAS ---
+        self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="#2B2B2B")
+        self.stats_frame.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkLabel(self.stats_frame, text="INFORMACIÓN MATRIZ", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(pady=(5,2))
+        
+        self.lbl_orig_dim = ctk.CTkLabel(self.stats_frame, text="Original: ...", font=("Consolas", 11))
+        self.lbl_orig_dim.pack(anchor="w", padx=10)
+        
+        self.lbl_view_dim = ctk.CTkLabel(self.stats_frame, text="Visor: ...", font=("Consolas", 11))
+        self.lbl_view_dim.pack(anchor="w", padx=10, pady=(0, 5))
+
+        # --- BOTONES ---
         ctk.CTkButton(self.sidebar, text="Restablecer Vista", command=self.load_full_map).pack(pady=10, padx=20, fill="x")
         
         ctk.CTkLabel(self.sidebar, text="Herramientas", font=("Arial", 14, "bold")).pack(pady=(20,10))
@@ -189,18 +207,51 @@ class EcuadorMapVisor(ctk.CTk):
     def status(self, txt): self.status_lbl.configure(text=txt)
 
     def load_full_map(self):
-        if not os.path.exists(DEM_PATH): return messagebox.showerror("Error", "Falta DEM.")
+        if not os.path.exists(DEM_LIGERO_PATH): return messagebox.showerror("Error", "Falta DEM (Clipped).")
         self.ax.clear()
-        self.ax.set_title("Ecuador Continental", color="white", fontsize=14)
+        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
         self.ax.grid(False)
 
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
-        arr, _ = read_dem_roi_masked(DEM_PATH, BORDER_PATH, bounds)
         
+        # -------------------------------------------------------------
+        # PASO 1: LEER INFORMACIÓN DEL ORIGINAL (SIN CARGARLO EN RAM)
+        # -------------------------------------------------------------
+        orig_w, orig_h = 0, 0
+        if os.path.exists(DEM_FULL_PATH):
+            try:
+                # rasterio.open() solo lee el encabezado, es instantáneo
+                with rasterio.open(DEM_FULL_PATH) as src_full:
+                    orig_w, orig_h = src_full.width, src_full.height
+            except: pass
+        
+        # Si no existe el full, estimamos basado en el ligero (x10)
+        # Pero intentaremos mostrar los datos reales primero.
+        
+        # -------------------------------------------------------------
+        # PASO 2: CARGAR EL MAPA LIGERO (PARA VISUALIZAR)
+        # -------------------------------------------------------------
+        arr, _ = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, bounds)
+        
+        # Si no encontramos el original, usamos el ligero x10 como referencia visual
+        if orig_w == 0:
+            orig_h, orig_w = arr.shape[0] * 10, arr.shape[1] * 10
+            
+        # ACTUALIZAR ETIQUETA "ORIGINAL"
+        self.lbl_orig_dim.configure(text=f"Original: {orig_w} x {orig_h} px")
+        
+        # 3. Reducir para visualización en pantalla
         h, w = arr.shape
         scale = max(h,w)/800
-        arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale)) if scale > 1 else arr
+        if scale > 1:
+            arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale))
+        else:
+            arr_disp = arr
+            
+        # ACTUALIZAR ETIQUETA "VISOR"
+        disp_h, disp_w = arr_disp.shape
+        self.lbl_view_dim.configure(text=f"Visor:    {disp_w} x {disp_h} px")
         
         img = self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
         
@@ -225,40 +276,27 @@ class EcuadorMapVisor(ctk.CTk):
         self.canvas.draw()
         self.status("Mapa Continental Cargado.")
 
-    # --- AQUÍ ESTÁ LA MAGIA PARA ARREGLAR EL BUG DE HERRAMIENTAS ---
-    
     def reset_tools(self):
-        """Apaga cualquier herramienta activa (Zoom/Pan)"""
-        # Si el toolbar está en modo 'zoom rect' o 'pan/zoom', llamamos a la función
-        # correspondiente de nuevo para apagarlo (es un toggle).
-        if self.toolbar.mode == 'zoom rect':
-            self.toolbar.zoom()
-        elif self.toolbar.mode == 'pan/zoom':
-            self.toolbar.pan()
-            
-        # También desactivamos el selector de rectángulo
-        if self.rect_selector:
-            self.rect_selector.set_active(False)
+        if self.toolbar.mode == 'zoom rect': self.toolbar.zoom()
+        elif self.toolbar.mode == 'pan/zoom': self.toolbar.pan()
+        if self.rect_selector: self.rect_selector.set_active(False)
 
     def enable_zoom(self):
-        self.reset_tools() # Primero apagamos todo
-        self.toolbar.zoom() # Activamos solo Zoom
+        self.reset_tools()
+        self.toolbar.zoom()
         self.status("Herramienta: Zoom")
 
     def enable_pan(self):
-        self.reset_tools() # Primero apagamos todo
-        self.toolbar.pan() # Activamos solo Pan
+        self.reset_tools()
+        self.toolbar.pan()
         self.status("Herramienta: Mover")
 
     def enable_rect_select(self):
-        self.reset_tools() # Primero apagamos todo (esto desactiva el zoom si estaba prendido)
-        
+        self.reset_tools()
         def onselect(eclick, erelease):
             x1, y1, x2, y2 = eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata
             self.selected_bounds = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
             self.status("Zona seleccionada.")
-            
-        # Creamos/Activamos el selector
         self.rect_selector = RectangleSelector(self.ax, onselect, useblit=True, button=[1], interactive=True)
         self.rect_selector.set_active(True)
         self.status("Herramienta: Selección activa.")
@@ -275,7 +313,7 @@ class EcuadorMapVisor(ctk.CTk):
         self.status("Generando STL...")
         self.update_idletasks()
         try:
-            arr, _ = read_dem_roi_masked(DEM_PATH, BORDER_PATH, self.selected_bounds)
+            arr, _ = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, self.selected_bounds)
             arr_filled = np.nan_to_num(arr, nan=np.nanmin(arr))
             scale = max(arr_filled.shape) / dlg.result["target"]
             h, w = arr_filled.shape
