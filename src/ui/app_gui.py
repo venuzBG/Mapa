@@ -15,8 +15,6 @@ from rasterio.features import geometry_mask
 
 import geopandas as gpd
 
-
-
 # =========================
 # RUTAS DEL PROYECTO
 # =========================
@@ -24,259 +22,110 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUT_DIR = os.path.join(BASE_DIR, "outputs", "dem")
 
-DEM_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif")       # DEM grande (no lo subiste, pero existe en tu PC)
-BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")    # contorno Ecuador
+DEM_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif")
+BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")     # Borde País
+PROVINCES_PATH = os.path.join(DATA_DIR, "provincias.geojson") # Provincias
+CANTONES_PATH = os.path.join(DATA_DIR, "cantones.geojson")   # Cantones
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
 # =========================
-# UTILIDADES: GEOJSON (sin Galápagos)
+# UTILIDADES
 # =========================
 def load_ecuador_mainland_geometry(geojson_path: str):
-    """
-    Carga Ecuador y se queda SOLO con el polígono más grande (continental),
-    lo cual elimina Galápagos (generalmente vienen como geometrías separadas).
-    """
-    gdf = gpd.read_file(geojson_path)
+    """ Extrae solo el continente (polígono más grande) para ignorar islas """
+    try:
+        gdf = gpd.read_file(geojson_path)
+        geom = gdf.unary_union
+        if geom.geom_type == "MultiPolygon":
+            return max(list(geom.geoms), key=lambda g: g.area)
+        return geom
+    except Exception:
+        return None
 
-    # Si viene con varias features, disolvemos todo
-    geom = gdf.unary_union
-
-    # Si es MultiPolygon, elegir el de mayor "area" (en grados^2, suficiente para diferenciar Galápagos)
-    if geom.geom_type == "MultiPolygon":
-        mainland = max(list(geom.geoms), key=lambda g: g.area)
-        return mainland
-
-    return geom
-
-
-# =========================
-# UTILIDADES: BILINEAR DOWNSAMPLE (sin scipy)
-# =========================
 def bilinear_resize(arr: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
-    """
-    Redimensiona usando interpolación bilineal (pure numpy).
-    Funciona con NaN: se recomienda reemplazar NaN antes o enmascarar.
-    """
     h, w = arr.shape
-    if h == new_h and w == new_w:
-        return arr.copy()
+    if h == new_h and w == new_w: return arr
+    y, x = np.linspace(0, h - 1, new_h), np.linspace(0, w - 1, new_w)
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
+    x1, y1 = np.clip(x0 + 1, 0, w - 1), np.clip(y0 + 1, 0, h - 1)
+    wx, wy = x - x0, y - y0
+    Ia, Ib = arr[:, x0], arr[:, x1]
+    Ix = (1 - wx) * Ia + wx * Ib
+    I0, I1 = Ix[y0, :], Ix[y1, :]
+    return ((1 - wy)[:, None] * I0 + wy[:, None] * I1).astype(np.float32)
 
-    # coordenadas destino -> origen
-    y = np.linspace(0, h - 1, new_h)
-    x = np.linspace(0, w - 1, new_w)
-
-    x0 = np.floor(x).astype(int)
-    x1 = np.clip(x0 + 1, 0, w - 1)
-    y0 = np.floor(y).astype(int)
-    y1 = np.clip(y0 + 1, 0, h - 1)
-
-    # pesos
-    wx = x - x0
-    wy = y - y0
-
-    # interpolación en x
-    Ia = arr[:, x0]
-    Ib = arr[:, x1]
-    Ix = (1 - wx) * Ia + wx * Ib  # (h, new_w)
-
-    # interpolación en y (sobre Ix)
-    I0 = Ix[y0, :]
-    I1 = Ix[y1, :]
-    out = (1 - wy)[:, None] * I0 + wy[:, None] * I1
-    return out.astype(np.float32)
-
-
-# =========================
-# UTILIDADES: EXPORT STL (SÓLIDO MANIFOLD)
-# =========================
-class STLExporter:
-    """
-    Exporta una grilla de alturas a un STL sólido:
-    - Top surface
-    - Bottom (z=0)
-    - Side walls
-    """
-    @staticmethod
-    def _normal(v0, v1, v2):
-        a = v1 - v0
-        b = v2 - v0
-        n = np.cross(a, b)
-        norm = np.linalg.norm(n)
-        if norm == 0:
-            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        return (n / norm).astype(np.float32)
-
-    @staticmethod
-    def export_grid_solid_to_stl(
-        z: np.ndarray,
-        out_path: str,
-        cell_size_mm: float = 1.0,
-        base_thickness_mm: float = 2.0,
-        height_mm: float = 30.0,
-        fill_nan_with_min: bool = True
-    ):
-        """
-        z: matriz elevación en metros (o unidades), con NaN afuera.
-        Se normaliza a [base_thickness, base_thickness+height_mm]
-        y se crea un sólido cerrado.
-        """
-        if z.ndim != 2:
-            raise ValueError("z debe ser una matriz 2D")
-
-        zz = z.astype(np.float32)
-
-        valid = ~np.isnan(zz)
-        if valid.sum() == 0:
-            raise ValueError("La zona no tiene datos válidos (todo NaN).")
-
-        zmin = float(np.nanmin(zz))
-        zmax = float(np.nanmax(zz))
-        if zmax - zmin < 1e-6:
-            # todo plano
-            zscaled = np.full_like(zz, base_thickness_mm, dtype=np.float32)
-        else:
-            zscaled = (zz - zmin) / (zmax - zmin)  # 0..1
-            zscaled = base_thickness_mm + zscaled * height_mm
-
-        if fill_nan_with_min:
-            zscaled[~valid] = base_thickness_mm  # “piso” afuera
-
-        h, w = zscaled.shape
-
-        # Coordenadas XY (mm)
-        xs = np.arange(w, dtype=np.float32) * cell_size_mm
-        ys = np.arange(h, dtype=np.float32) * cell_size_mm
-
-        # Centramos para que caiga en el centro de la placa
-        xs = xs - xs.mean()
-        ys = ys - ys.mean()
-
-        # Triangles list: cada tri -> (normal, v0, v1, v2)
-        triangles = []
-
-        def vtx(i, j, top=True):
-            x = xs[j]
-            y = ys[i]
-            zval = float(zscaled[i, j]) if top else 0.0
-            return np.array([x, y, zval], dtype=np.float32)
-
-        # --- TOP ---
-        for i in range(h - 1):
-            for j in range(w - 1):
-                v00 = vtx(i, j, True)
-                v10 = vtx(i + 1, j, True)
-                v01 = vtx(i, j + 1, True)
-                v11 = vtx(i + 1, j + 1, True)
-
-                # dos tri (orientación hacia arriba)
-                n1 = STLExporter._normal(v00, v10, v01)
-                triangles.append((n1, v00, v10, v01))
-
-                n2 = STLExporter._normal(v10, v11, v01)
-                triangles.append((n2, v10, v11, v01))
-
-        # --- BOTTOM (invertido para que normal apunte hacia abajo) ---
-        for i in range(h - 1):
-            for j in range(w - 1):
-                v00 = vtx(i, j, False)
-                v10 = vtx(i + 1, j, False)
-                v01 = vtx(i, j + 1, False)
-                v11 = vtx(i + 1, j + 1, False)
-
-                n1 = STLExporter._normal(v00, v01, v10)
-                triangles.append((n1, v00, v01, v10))
-
-                n2 = STLExporter._normal(v10, v01, v11)
-                triangles.append((n2, v10, v01, v11))
-
-        # --- SIDE WALLS (perímetro) ---
-        def add_wall(p0_top, p1_top, p0_bot, p1_bot):
-            # dos tri para el quad, orientación hacia afuera depende del borde
-            n1 = STLExporter._normal(p0_bot, p1_bot, p1_top)
-            triangles.append((n1, p0_bot, p1_bot, p1_top))
-
-            n2 = STLExporter._normal(p0_bot, p1_top, p0_top)
-            triangles.append((n2, p0_bot, p1_top, p0_top))
-
-        # borde superior i=0
-        i = 0
-        for j in range(w - 1):
-            add_wall(vtx(i, j, True), vtx(i, j + 1, True), vtx(i, j, False), vtx(i, j + 1, False))
-        # borde inferior i=h-1
-        i = h - 1
-        for j in range(w - 1):
-            # invertir para mantener “afuera”
-            add_wall(vtx(i, j + 1, True), vtx(i, j, True), vtx(i, j + 1, False), vtx(i, j, False))
-
-        # borde izquierdo j=0
-        j = 0
-        for i in range(h - 1):
-            add_wall(vtx(i + 1, j, True), vtx(i, j, True), vtx(i + 1, j, False), vtx(i, j, False))
-        # borde derecho j=w-1
-        j = w - 1
-        for i in range(h - 1):
-            add_wall(vtx(i, j, True), vtx(i + 1, j, True), vtx(i, j, False), vtx(i + 1, j, False))
-
-        # --- Escribir STL binario ---
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "wb") as f:
-            header = b"Ecuador DEM solid STL".ljust(80, b" ")
-            f.write(header)
-            f.write(struct.pack("<I", len(triangles)))
-
-            for (n, a, b, c) in triangles:
-                f.write(struct.pack("<3f", float(n[0]), float(n[1]), float(n[2])))
-                f.write(struct.pack("<3f", float(a[0]), float(a[1]), float(a[2])))
-                f.write(struct.pack("<3f", float(b[0]), float(b[1]), float(b[2])))
-                f.write(struct.pack("<3f", float(c[0]), float(c[1]), float(c[2])))
-                f.write(struct.pack("<H", 0))
-
-        return out_path
-
-
-# =========================
-# LECTURA EFICIENTE DE ROI (sin cargar todo)
-# =========================
-def read_dem_roi_masked(
-    dem_path: str,
-    geojson_path: str,
-    bounds_lonlat: tuple[float, float, float, float],
-):
-    """
-    Lee un ROI del DEM usando Window (eficiente RAM),
-    y aplica máscara del Ecuador continental (sin Galápagos).
-    Devuelve (arr, transform).
-    """
+def read_dem_roi_masked(dem_path: str, geojson_path: str, bounds_lonlat: tuple):
     minx, miny, maxx, maxy = bounds_lonlat
-
     mainland = load_ecuador_mainland_geometry(geojson_path)
-
     with rasterio.open(dem_path) as src:
         win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
         win = win.round_offsets().round_lengths()
-
         arr = src.read(1, window=win).astype(np.float32)
         transform = src.window_transform(win)
-
-        # nodata -> NaN
-        nodata = src.nodata
-        if nodata is not None:
-            arr[arr == nodata] = np.nan
-
-        # máscara Ecuador continental
-        mask = geometry_mask(
-            [mainland],
-            out_shape=arr.shape,
-            transform=transform,
-            invert=True  # True = dentro del polígono
-        )
-        arr[~mask] = np.nan
-
+        if src.nodata is not None: arr[arr == src.nodata] = np.nan
+        if mainland:
+            mask = geometry_mask([mainland], out_shape=arr.shape, transform=transform, invert=True)
+            arr[~mask] = np.nan
     return arr, transform
 
+# =========================
+# CLASE EXPORTADOR STL
+# =========================
+class STLExporter:
+    @staticmethod
+    def _normal(v0, v1, v2):
+        n = np.cross(v1 - v0, v2 - v0)
+        norm = np.linalg.norm(n)
+        return (n / norm).astype(np.float32) if norm > 0 else np.zeros(3, dtype=np.float32)
+
+    @staticmethod
+    def export_grid_solid_to_stl(z, out_path, cell_size_mm, base_thickness_mm, height_mm, fill_nan_with_min=True):
+        zz = z.astype(np.float32)
+        valid = ~np.isnan(zz)
+        zmin, zmax = np.nanmin(zz), np.nanmax(zz)
+        zscaled = np.full_like(zz, base_thickness_mm) if (zmax - zmin < 1e-6) else \
+                  (base_thickness_mm + ((zz - zmin) / (zmax - zmin)) * height_mm)
+        if fill_nan_with_min: zscaled[~valid] = base_thickness_mm
+
+        h, w = zscaled.shape
+        xs = (np.arange(w, dtype=np.float32) * cell_size_mm); xs -= xs.mean()
+        ys = (np.arange(h, dtype=np.float32) * cell_size_mm); ys -= ys.mean()
+
+        triangles = []
+        def vtx(i, j, top): return np.array([xs[j], ys[i], float(zscaled[i, j]) if top else 0.0], dtype=np.float32)
+
+        for i in range(h - 1):
+            for j in range(w - 1):
+                vt00, vt10, vt01, vt11 = vtx(i,j,True), vtx(i+1,j,True), vtx(i,j+1,True), vtx(i+1,j+1,True)
+                vb00, vb10, vb01, vb11 = vtx(i,j,False), vtx(i+1,j,False), vtx(i,j+1,False), vtx(i+1,j+1,False)
+                triangles.extend([
+                    (STLExporter._normal(vt00, vt10, vt01), vt00, vt10, vt01),
+                    (STLExporter._normal(vt10, vt11, vt01), vt10, vt11, vt01),
+                    (STLExporter._normal(vb00, vb01, vb10), vb00, vb01, vb10),
+                    (STLExporter._normal(vb10, vb01, vb11), vb10, vb01, vb11)
+                ])
+
+        def add_wall(p0t, p1t, p0b, p1b):
+            triangles.extend([
+                (STLExporter._normal(p0b, p1b, p1t), p0b, p1b, p1t),
+                (STLExporter._normal(p0b, p1t, p0t), p0b, p1t, p0t)
+            ])
+            
+        for j in range(w-1): add_wall(vtx(0,j,True), vtx(0,j+1,True), vtx(0,j,False), vtx(0,j+1,False))
+        for j in range(w-1): add_wall(vtx(h-1,j+1,True), vtx(h-1,j,True), vtx(h-1,j+1,False), vtx(h-1,j,False))
+        for i in range(h-1): add_wall(vtx(i+1,0,True), vtx(i,0,True), vtx(i+1,0,False), vtx(i,0,False))
+        for i in range(h-1): add_wall(vtx(i,w-1,True), vtx(i+1,w-1,True), vtx(i,w-1,False), vtx(i+1,w-1,False))
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(b"Ecuador DEM STL".ljust(80, b" "))
+            f.write(struct.pack("<I", len(triangles)))
+            for n, a, b, c in triangles:
+                for p in [n, a, b, c]: f.write(struct.pack("<3f", *p))
+                f.write(struct.pack("<H", 0))
 
 # =========================
 # GUI PRINCIPAL
@@ -284,236 +133,128 @@ def read_dem_roi_masked(
 class EcuadorMapVisor(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Visor Topográfico de Ecuador Continental - Grupo 4")
+        self.title("Visor Ecuador Continental - Grupo 4")
         self.geometry("1400x900")
-
-        self.selected_bounds = None  # (minx, miny, maxx, maxy)
+        self.selected_bounds = None
         self.rect_selector = None
-
         self.setup_ui()
         self.load_full_map()
 
     def setup_ui(self):
-        # Grid layout
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-
-        # Sidebar
-        self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
+        
+        self.sidebar = ctk.CTkFrame(self, width=300, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
+        
+        ctk.CTkLabel(self.sidebar, text="CONTROLES", font=("Arial", 20, "bold")).pack(pady=20)
+        ctk.CTkButton(self.sidebar, text="Restablecer Vista", command=self.load_full_map).pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkLabel(self.sidebar, text="Herramientas", font=("Arial", 14, "bold")).pack(pady=(20,10))
+        ctk.CTkButton(self.sidebar, text="Zoom", command=lambda: [self.toolbar.zoom(), self.status("Zoom activo")]).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=lambda: [self.toolbar.pan(), self.status("Mover activo")]).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(self.sidebar, text="Seleccionar Zona", command=self.enable_rect_select).pack(pady=5, padx=20, fill="x")
+        
+        ctk.CTkButton(self.sidebar, text="EXPORTAR STL", command=self.export_stl, fg_color="#D00000", hover_color="#800000").pack(pady=30, padx=20, fill="x")
+        
+        self.status_lbl = ctk.CTkLabel(self.sidebar, text="Listo.", text_color="gray")
+        self.status_lbl.pack(side="bottom", pady=20)
 
-        ctk.CTkLabel(self.sidebar, text="MENÚ GEOGRÁFICO", font=("Arial", 22, "bold")).pack(pady=20)
-
-        ctk.CTkLabel(self.sidebar, text="Visualizar por Región:", font=("Arial", 14)).pack(pady=(10, 5))
-        ctk.CTkButton(self.sidebar, text="Todo el Ecuador", font=("Arial", 13),
-                      command=self.load_full_map).pack(pady=8, padx=25, fill="x")
-
-        ctk.CTkLabel(self.sidebar, text="Configuraciones", font=("Arial", 16, "bold")).pack(pady=(25, 10))
-
-        ctk.CTkButton(self.sidebar, text="Zoom", command=self.enable_zoom).pack(pady=6, padx=25, fill="x")
-        ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=self.enable_pan).pack(pady=6, padx=25, fill="x")
-        ctk.CTkButton(self.sidebar, text="Seleccionar zona (rectángulo)", command=self.enable_rect_select).pack(pady=6, padx=25, fill="x")
-        ctk.CTkButton(self.sidebar, text="Exportar zona a STL (3D)", command=self.export_selected_to_stl).pack(pady=10, padx=25, fill="x")
-
-        self.status_label = ctk.CTkLabel(self.sidebar, text="Estado: listo.", text_color="gray", font=("Arial", 11))
-        self.status_label.pack(side="bottom", pady=20)
-
-        # Map container
-        self.map_container = ctk.CTkFrame(self, fg_color="#1a1a1a")
-        self.map_container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
-
-        self.fig, self.ax = plt.subplots(figsize=(10, 10), facecolor="#1a1a1a")
-        self.ax.set_facecolor("#000000")
-        self.ax.tick_params(colors="white", labelsize=9)
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.map_container)
+        self.map_frame = ctk.CTkFrame(self, fg_color="#1a1a1a")
+        self.map_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+        
+        self.fig, self.ax = plt.subplots(figsize=(8,8), facecolor="#1a1a1a")
+        self.ax.set_facecolor("black")
+        self.ax.tick_params(colors="white")
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.map_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        self.toolbar_frame = ctk.CTkFrame(self.map_container, height=40, fg_color="transparent")
-        self.toolbar_frame.pack(side="bottom", fill="x")
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
+        
+        self.toolbar = NavigationToolbar2Tk(self.canvas, ctk.CTkFrame(self.map_frame))
         self.toolbar.update()
+        
+    def status(self, txt): self.status_lbl.configure(text=txt)
 
-        self.colorbar = None
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def on_close(self):
-        # Evita errores de "invalid command name ... after script"
-        try:
-            if self.rect_selector is not None:
-                self.rect_selector.set_active(False)
-        except:
-            pass
-        self.destroy()
-
-    # =========================
-    # VISUALIZACIÓN
-    # =========================
     def load_full_map(self):
         if not os.path.exists(DEM_PATH):
-            messagebox.showerror("Falta DEM", f"No existe:\n{DEM_PATH}")
-            return
-        if not os.path.exists(BORDER_PATH):
-            messagebox.showerror("Falta GeoJSON", f"No existe:\n{BORDER_PATH}")
+            messagebox.showerror("Error", "Falta el archivo DEM.")
             return
 
         self.ax.clear()
-        self.ax.set_title("Mapa de Elevación - Todo el Ecuador", color="white", fontsize=16)
-        self.ax.set_xlabel("Longitud (Grados)", color="white")
-        self.ax.set_ylabel("Latitud (Grados)", color="white")
-        self.ax.grid(True, color="gray", linestyle="--", alpha=0.25)
+        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
+        self.ax.grid(False)
 
-        # Para mostrar rápido: usamos una vista “display” (downsample) sin cargar todo
-        # Cargamos bounds Ecuador y leemos una ventana grande aproximada
+        # 1. Obtener límites SOLO del continente
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
-        minx, miny, maxx, maxy = mainland.bounds
-
-        arr, transform = read_dem_roi_masked(DEM_PATH, BORDER_PATH, (minx, miny, maxx, maxy))
-
-        # downsample display para que la UI sea fluida
-        max_side = 900
+        # Si falla (ej. archivo no tiene islas), usamos bounds normales
+        bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
+        
+        # 2. Cargar DEM Recortado
+        arr, _ = read_dem_roi_masked(DEM_PATH, BORDER_PATH, bounds)
+        
+        # 3. Mostrar Imagen
         h, w = arr.shape
-        scale = max(h, w) / max_side
-        if scale > 1:
-            new_h = max(200, int(h / scale))
-            new_w = max(200, int(w / scale))
-            arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), new_h, new_w)
-            # ojo: no re-mascara, solo display (ya fue enmascarado)
-        else:
-            arr_disp = arr
+        scale = max(h,w)/800
+        arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale)) if scale > 1 else arr
+        self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
+        
+        # 4. Dibujar Líneas (Cantones y Provincias)
+        try:
+            # Cantones
+            f_cant = CANTONES_PATH if os.path.exists(CANTONES_PATH) else BORDER_PATH
+            gpd.read_file(f_cant).boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
+            
+            # Provincias
+            if os.path.exists(PROVINCES_PATH):
+                gpd.read_file(PROVINCES_PATH).boundary.plot(ax=self.ax, linewidth=0.8, color="white", alpha=0.8)
+            
+            # Borde País
+            if mainland:
+                gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
+        except: pass
 
-        extent = [
-            minx, maxx,
-            miny, maxy
-        ]
-
-        img = self.ax.imshow(arr_disp, extent=extent, cmap="terrain", origin="upper")
-
-        # borde
-        gdf = gpd.read_file(BORDER_PATH)
-        main_geom = load_ecuador_mainland_geometry(BORDER_PATH)
-        gpd.GeoSeries([main_geom], crs="EPSG:4326").boundary.plot(ax=self.ax, linewidth=1.5, color="#00E5FF")
-
-        # colorbar única
-        if self.colorbar is not None:
-            self.colorbar.remove()
-            self.colorbar = None
-        self.colorbar = self.fig.colorbar(img, ax=self.ax, fraction=0.046, pad=0.04)
-        self.colorbar.set_label("Altura [m]", color="white")
-        self.colorbar.ax.yaxis.set_tick_params(color="white", labelcolor="white")
+        # --- EL TRUCO PARA ELIMINAR EL FONDO NEGRO Y GALÁPAGOS ---
+        # Forzamos los límites de la cámara a los límites del continente exacto
+        self.ax.set_xlim(bounds[0], bounds[2])
+        self.ax.set_ylim(bounds[1], bounds[3])
 
         self.canvas.draw()
-        self.status_label.configure(text="Estado: mapa cargado. Selecciona zona para exportar STL.")
-
-    # =========================
-    # HERRAMIENTAS
-    # =========================
-    def enable_zoom(self):
-        self.toolbar.zoom()
-        self.status_label.configure(text="Estado: Zoom activo (toolbar).")
-
-    def enable_pan(self):
-        self.toolbar.pan()
-        self.status_label.configure(text="Estado: Pan activo (toolbar).")
+        self.status("Mapa Continental Cargado.")
 
     def enable_rect_select(self):
-        # activa selector de rectángulo sobre el plot
-        if self.rect_selector is not None:
-            self.rect_selector.set_active(False)
-
+        if self.rect_selector: self.rect_selector.set_active(False)
         def onselect(eclick, erelease):
-            x1, y1 = eclick.xdata, eclick.ydata
-            x2, y2 = erelease.xdata, erelease.ydata
-            if None in (x1, y1, x2, y2):
-                return
-            minx, maxx = sorted([x1, x2])
-            miny, maxy = sorted([y1, y2])
-            self.selected_bounds = (minx, miny, maxx, maxy)
-            self.status_label.configure(text=f"Estado: zona seleccionada ({minx:.3f},{miny:.3f})-({maxx:.3f},{maxy:.3f})")
-
-        self.rect_selector = RectangleSelector(
-            self.ax,
-            onselect,
-            useblit=True,
-            button=[1],
-            interactive=True
-        )
+            x1, y1, x2, y2 = eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata
+            self.selected_bounds = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
+            self.status("Zona seleccionada.")
+        self.rect_selector = RectangleSelector(self.ax, onselect, useblit=True, button=[1], interactive=True)
         self.rect_selector.set_active(True)
-        self.status_label.configure(text="Estado: selección activa. Arrastra un rectángulo en el mapa.")
+        self.status("Selecciona una zona...")
 
-    # =========================
-    # EXPORT STL (SÓLIDO)
-    # =========================
-    def export_selected_to_stl(self):
-        if self.selected_bounds is None:
-            messagebox.showerror("Error", "Primero selecciona una zona con el rectángulo.")
-            return
-
-        if not os.path.exists(DEM_PATH):
-            messagebox.showerror("Falta DEM", f"No existe:\n{DEM_PATH}")
-            return
-        if not os.path.exists(BORDER_PATH):
-            messagebox.showerror("Falta GeoJSON", f"No existe:\n{BORDER_PATH}")
-            return
-
+    def export_stl(self):
+        if not self.selected_bounds: return messagebox.showwarning("!", "Selecciona una zona primero.")
         dlg = ExportDialog(self)
-        self.wait_window(dlg)  # espera a que el usuario cierre el diálogo
-
-        if dlg.result is None:
-            return  # Canceló
-
-        target = dlg.result["target"]
-        base_mm = dlg.result["base_mm"]
-        height_mm = dlg.result["height_mm"]
-        cell_mm = dlg.result["cell_mm"]
-
-        out_path = filedialog.asksaveasfilename(
-            defaultextension=".stl",
-            filetypes=[("STL", "*.stl")],
-            initialfile="zona_exportada.stl"
-        )
-        if not out_path:
-            return
-
-        self.status_label.configure(text="Estado: leyendo DEM (ROI) y preparando STL...")
+        self.wait_window(dlg)
+        if not dlg.result: return
+        
+        fpath = filedialog.asksaveasfilename(defaultextension=".stl", filetypes=[("STL","*.stl")])
+        if not fpath: return
+        
+        self.status("Generando STL...")
         self.update_idletasks()
-
         try:
             arr, _ = read_dem_roi_masked(DEM_PATH, BORDER_PATH, self.selected_bounds)
-
-            # Reemplaza NaN temporal para bilinear (display/export)
-            # (afuera del Ecuador se aplana al mínimo válido)
-            vmin = float(np.nanmin(arr))
-            arr_filled = np.nan_to_num(arr, nan=vmin).astype(np.float32)
-
-            # Downsample (para reducir peso/triángulos)
+            arr_filled = np.nan_to_num(arr, nan=np.nanmin(arr))
+            scale = max(arr_filled.shape) / dlg.result["target"]
             h, w = arr_filled.shape
-            scale = max(h, w) / target
-            if scale > 1:
-                new_h = max(50, int(h / scale))
-                new_w = max(50, int(w / scale))
-                arr_small = bilinear_resize(arr_filled, new_h, new_w)
-            else:
-                arr_small = arr_filled
-
-            # Exportar STL sólido
-            STLExporter.export_grid_solid_to_stl(
-                z=arr_small,
-                out_path=out_path,
-                cell_size_mm=cell_mm,
-                base_thickness_mm=base_mm,
-                height_mm=height_mm,
-                fill_nan_with_min=True
-            )
-
-            messagebox.showinfo("Éxito", f"STL exportado correctamente:\n{out_path}\n\nÁbrelo en Bambu Studio.")
-            self.status_label.configure(text=f"Estado: STL exportado -> {os.path.basename(out_path)}")
-
+            arr_final = bilinear_resize(arr_filled, int(h/scale), int(w/scale)) if scale > 1 else arr_filled
+            
+            STLExporter.export_grid_solid_to_stl(arr_final, fpath, dlg.result["cell_mm"], dlg.result["base_mm"], dlg.result["height_mm"])
+            messagebox.showinfo("OK", "STL Listo.")
+            self.status("Listo.")
         except Exception as e:
-            messagebox.showerror("Error", f"No se pudo exportar STL:\n{str(e)}")
-            self.status_label.configure(text="Estado: error exportando STL.")
-
+            messagebox.showerror("Error", str(e))
+            self.status("Error.")
 
 if __name__ == "__main__":
     app = EcuadorMapVisor()
