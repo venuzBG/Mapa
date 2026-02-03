@@ -14,6 +14,7 @@ from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
 
 import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon # <--- NUEVA IMPORTACIÓN NECESARIA
 
 # =========================
 # RUTAS DEL PROYECTO
@@ -35,14 +36,36 @@ ctk.set_default_color_theme("blue")
 # UTILIDADES
 # =========================
 def load_ecuador_mainland_geometry(geojson_path: str):
-    """ Extrae solo el continente (polígono más grande) para ignorar islas """
+    """ 
+    Carga el contorno, une todo y ELIMINA LOS AGUJEROS INTERNOS (Slivers)
+    para evitar que aparezcan líneas gruesas dentro del mapa.
+    """
     try:
         gdf = gpd.read_file(geojson_path)
+        
+        # 1. Unir todas las geometrías en una sola
         geom = gdf.unary_union
-        if geom.geom_type == "MultiPolygon":
-            return max(list(geom.geoms), key=lambda g: g.area)
-        return geom
-    except Exception:
+
+        # 2. Función para borrar agujeros (se queda solo con la cáscara de afuera)
+        def drop_holes(geometry):
+            if geometry.geom_type == 'Polygon':
+                return Polygon(geometry.exterior)
+            elif geometry.geom_type == 'MultiPolygon':
+                return MultiPolygon([Polygon(p.exterior) for p in geometry.geoms])
+            return geometry
+
+        # 3. Aplicar la limpieza
+        geom_clean = drop_holes(geom)
+
+        # 4. Quedarse solo con el continente (el polígono más grande)
+        if geom_clean.geom_type == "MultiPolygon":
+            mainland = max(list(geom_clean.geoms), key=lambda g: g.area)
+            return mainland
+        
+        return geom_clean
+
+    except Exception as e:
+        print(f"Error cargando geometría: {e}")
         return None
 
 def bilinear_resize(arr: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
@@ -137,7 +160,7 @@ class EcuadorMapVisor(ctk.CTk):
         self.geometry("1400x900")
         self.selected_bounds = None
         self.rect_selector = None
-        self.colorbar = None # Inicializamos la variable
+        self.colorbar = None
         self.setup_ui()
         self.load_full_map()
 
@@ -182,10 +205,10 @@ class EcuadorMapVisor(ctk.CTk):
             return
 
         self.ax.clear()
-        self.ax.set_title("Mapa del Ecuador", color="white", fontsize=14)
+        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
         self.ax.grid(False)
 
-        # 1. Obtener límites SOLO del continente
+        # 1. Obtener límites SOLO del continente (LIMPIO DE AGUJEROS)
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
         
@@ -197,29 +220,28 @@ class EcuadorMapVisor(ctk.CTk):
         scale = max(h,w)/800
         arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale)) if scale > 1 else arr
         
-        # Guardamos la imagen en 'img' para usarla en la colorbar
         img = self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
         
-        # 4. Dibujar Líneas (Cantones y Provincias)
+        # 4. Dibujar Líneas
         try:
-            # Cantones
+            # Cantones (Finitos)
             f_cant = CANTONES_PATH if os.path.exists(CANTONES_PATH) else BORDER_PATH
             gpd.read_file(f_cant).boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
             
-            # Provincias
+            # Provincias (Medio)
             if os.path.exists(PROVINCES_PATH):
                 gpd.read_file(PROVINCES_PATH).boundary.plot(ax=self.ax, linewidth=0.8, color="white", alpha=0.8)
             
-            # Borde País
+            # Borde País (Grueso) - AHORA SOLO DIBUJARÁ EL BORDE EXTERIOR REAL
             if mainland:
                 gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
         except: pass
 
-        # --- RECORTE DE CÁMARA (Para quitar fondo negro) ---
+        # --- RECORTE DE CÁMARA ---
         self.ax.set_xlim(bounds[0], bounds[2])
         self.ax.set_ylim(bounds[1], bounds[3])
 
-        # --- BARRA DE COLORES (Aquí es donde la recuperamos) ---
+        # --- BARRA DE COLORES ---
         if self.colorbar: 
             try: self.colorbar.remove()
             except: pass
