@@ -14,7 +14,7 @@ from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
 
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon # <--- NUEVA IMPORTACIÓN NECESARIA
+from shapely.geometry import Polygon, MultiPolygon
 
 # =========================
 # RUTAS DEL PROYECTO
@@ -24,29 +24,23 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 OUT_DIR = os.path.join(BASE_DIR, "outputs", "dem")
 
 DEM_PATH = os.path.join(OUT_DIR, "ecuador_display_clipped.tif")
-BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")     # Borde País
-PROVINCES_PATH = os.path.join(DATA_DIR, "provincias.geojson") # Provincias
-CANTONES_PATH = os.path.join(DATA_DIR, "cantones.geojson")   # Cantones
+BORDER_PATH = os.path.join(DATA_DIR, "ecuador.geojson")     
+PROVINCES_PATH = os.path.join(DATA_DIR, "provincias.geojson") 
+CANTONES_PATH = os.path.join(DATA_DIR, "cantones.geojson")   
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
 # =========================
-# UTILIDADES
+# UTILIDADES GEOGRÁFICAS
 # =========================
 def load_ecuador_mainland_geometry(geojson_path: str):
-    """ 
-    Carga el contorno, une todo y ELIMINA LOS AGUJEROS INTERNOS (Slivers)
-    para evitar que aparezcan líneas gruesas dentro del mapa.
-    """
+    """ Carga geometría limpia sin agujeros internos """
     try:
         gdf = gpd.read_file(geojson_path)
-        
-        # 1. Unir todas las geometrías en una sola
         geom = gdf.unary_union
 
-        # 2. Función para borrar agujeros (se queda solo con la cáscara de afuera)
         def drop_holes(geometry):
             if geometry.geom_type == 'Polygon':
                 return Polygon(geometry.exterior)
@@ -54,18 +48,13 @@ def load_ecuador_mainland_geometry(geojson_path: str):
                 return MultiPolygon([Polygon(p.exterior) for p in geometry.geoms])
             return geometry
 
-        # 3. Aplicar la limpieza
         geom_clean = drop_holes(geom)
 
-        # 4. Quedarse solo con el continente (el polígono más grande)
         if geom_clean.geom_type == "MultiPolygon":
-            mainland = max(list(geom_clean.geoms), key=lambda g: g.area)
-            return mainland
-        
+            return max(list(geom_clean.geoms), key=lambda g: g.area)
         return geom_clean
-
     except Exception as e:
-        print(f"Error cargando geometría: {e}")
+        print(f"Error geo: {e}")
         return None
 
 def bilinear_resize(arr: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
@@ -95,7 +84,7 @@ def read_dem_roi_masked(dem_path: str, geojson_path: str, bounds_lonlat: tuple):
     return arr, transform
 
 # =========================
-# CLASE EXPORTADOR STL
+# EXPORTADOR STL
 # =========================
 class STLExporter:
     @staticmethod
@@ -175,8 +164,8 @@ class EcuadorMapVisor(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="Restablecer Vista", command=self.load_full_map).pack(pady=10, padx=20, fill="x")
         
         ctk.CTkLabel(self.sidebar, text="Herramientas", font=("Arial", 14, "bold")).pack(pady=(20,10))
-        ctk.CTkButton(self.sidebar, text="Zoom", command=lambda: [self.toolbar.zoom(), self.status("Zoom activo")]).pack(pady=5, padx=20, fill="x")
-        ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=lambda: [self.toolbar.pan(), self.status("Mover activo")]).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(self.sidebar, text="Zoom", command=self.enable_zoom).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=self.enable_pan).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(self.sidebar, text="Seleccionar Zona", command=self.enable_rect_select).pack(pady=5, padx=20, fill="x")
         
         ctk.CTkButton(self.sidebar, text="EXPORTAR STL", command=self.export_stl, fg_color="#D00000", hover_color="#800000").pack(pady=30, padx=20, fill="x")
@@ -200,52 +189,34 @@ class EcuadorMapVisor(ctk.CTk):
     def status(self, txt): self.status_lbl.configure(text=txt)
 
     def load_full_map(self):
-        if not os.path.exists(DEM_PATH):
-            messagebox.showerror("Error", "Falta el archivo DEM.")
-            return
-
+        if not os.path.exists(DEM_PATH): return messagebox.showerror("Error", "Falta DEM.")
         self.ax.clear()
-        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
+        self.ax.set_title("Ecuador Continental", color="white", fontsize=14)
         self.ax.grid(False)
 
-        # 1. Obtener límites SOLO del continente (LIMPIO DE AGUJEROS)
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
-        
-        # 2. Cargar DEM Recortado
         arr, _ = read_dem_roi_masked(DEM_PATH, BORDER_PATH, bounds)
         
-        # 3. Mostrar Imagen
         h, w = arr.shape
         scale = max(h,w)/800
         arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale)) if scale > 1 else arr
         
         img = self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
         
-        # 4. Dibujar Líneas
         try:
-            # Cantones (Finitos)
             f_cant = CANTONES_PATH if os.path.exists(CANTONES_PATH) else BORDER_PATH
             gpd.read_file(f_cant).boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
-            
-            # Provincias (Medio)
-            if os.path.exists(PROVINCES_PATH):
-                gpd.read_file(PROVINCES_PATH).boundary.plot(ax=self.ax, linewidth=0.8, color="white", alpha=0.8)
-            
-            # Borde País (Grueso) - AHORA SOLO DIBUJARÁ EL BORDE EXTERIOR REAL
-            if mainland:
-                gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
+            if os.path.exists(PROVINCES_PATH): gpd.read_file(PROVINCES_PATH).boundary.plot(ax=self.ax, linewidth=0.8, color="white", alpha=0.8)
+            if mainland: gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
         except: pass
 
-        # --- RECORTE DE CÁMARA ---
         self.ax.set_xlim(bounds[0], bounds[2])
         self.ax.set_ylim(bounds[1], bounds[3])
 
-        # --- BARRA DE COLORES ---
         if self.colorbar: 
             try: self.colorbar.remove()
             except: pass
-            
         self.colorbar = self.fig.colorbar(img, ax=self.ax, fraction=0.046, pad=0.04)
         self.colorbar.set_label("Altura [m]", color="white")
         self.colorbar.ax.yaxis.set_tick_params(color="white", labelcolor="white")
@@ -254,15 +225,43 @@ class EcuadorMapVisor(ctk.CTk):
         self.canvas.draw()
         self.status("Mapa Continental Cargado.")
 
+    # --- AQUÍ ESTÁ LA MAGIA PARA ARREGLAR EL BUG DE HERRAMIENTAS ---
+    
+    def reset_tools(self):
+        """Apaga cualquier herramienta activa (Zoom/Pan)"""
+        # Si el toolbar está en modo 'zoom rect' o 'pan/zoom', llamamos a la función
+        # correspondiente de nuevo para apagarlo (es un toggle).
+        if self.toolbar.mode == 'zoom rect':
+            self.toolbar.zoom()
+        elif self.toolbar.mode == 'pan/zoom':
+            self.toolbar.pan()
+            
+        # También desactivamos el selector de rectángulo
+        if self.rect_selector:
+            self.rect_selector.set_active(False)
+
+    def enable_zoom(self):
+        self.reset_tools() # Primero apagamos todo
+        self.toolbar.zoom() # Activamos solo Zoom
+        self.status("Herramienta: Zoom")
+
+    def enable_pan(self):
+        self.reset_tools() # Primero apagamos todo
+        self.toolbar.pan() # Activamos solo Pan
+        self.status("Herramienta: Mover")
+
     def enable_rect_select(self):
-        if self.rect_selector: self.rect_selector.set_active(False)
+        self.reset_tools() # Primero apagamos todo (esto desactiva el zoom si estaba prendido)
+        
         def onselect(eclick, erelease):
             x1, y1, x2, y2 = eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata
             self.selected_bounds = (min(x1,x2), min(y1,y2), max(x1,x2), max(y1,y2))
             self.status("Zona seleccionada.")
+            
+        # Creamos/Activamos el selector
         self.rect_selector = RectangleSelector(self.ax, onselect, useblit=True, button=[1], interactive=True)
         self.rect_selector.set_active(True)
-        self.status("Selecciona una zona...")
+        self.status("Herramienta: Selección activa.")
 
     def export_stl(self):
         if not self.selected_bounds: return messagebox.showwarning("!", "Selecciona una zona primero.")
