@@ -137,6 +137,7 @@ class EcuadorMapVisor(ctk.CTk):
         self.geometry("1400x900")
         self.selected_bounds = None
         self.rect_selector = None
+        self.colorbar = None # Inicializamos la variable
         self.setup_ui()
         self.load_full_map()
 
@@ -181,12 +182,11 @@ class EcuadorMapVisor(ctk.CTk):
             return
 
         self.ax.clear()
-        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
+        self.ax.set_title("Mapa del Ecuador", color="white", fontsize=14)
         self.ax.grid(False)
 
         # 1. Obtener límites SOLO del continente
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
-        # Si falla (ej. archivo no tiene islas), usamos bounds normales
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
         
         # 2. Cargar DEM Recortado
@@ -196,7 +196,9 @@ class EcuadorMapVisor(ctk.CTk):
         h, w = arr.shape
         scale = max(h,w)/800
         arr_disp = bilinear_resize(np.nan_to_num(arr, nan=np.nanmin(arr)), int(h/scale), int(w/scale)) if scale > 1 else arr
-        self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
+        
+        # Guardamos la imagen en 'img' para usarla en la colorbar
+        img = self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
         
         # 4. Dibujar Líneas (Cantones y Provincias)
         try:
@@ -213,10 +215,19 @@ class EcuadorMapVisor(ctk.CTk):
                 gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
         except: pass
 
-        # --- EL TRUCO PARA ELIMINAR EL FONDO NEGRO Y GALÁPAGOS ---
-        # Forzamos los límites de la cámara a los límites del continente exacto
+        # --- RECORTE DE CÁMARA (Para quitar fondo negro) ---
         self.ax.set_xlim(bounds[0], bounds[2])
         self.ax.set_ylim(bounds[1], bounds[3])
+
+        # --- BARRA DE COLORES (Aquí es donde la recuperamos) ---
+        if self.colorbar: 
+            try: self.colorbar.remove()
+            except: pass
+            
+        self.colorbar = self.fig.colorbar(img, ax=self.ax, fraction=0.046, pad=0.04)
+        self.colorbar.set_label("Altura [m]", color="white")
+        self.colorbar.ax.yaxis.set_tick_params(color="white", labelcolor="white")
+        self.colorbar.outline.set_edgecolor('white')
 
         self.canvas.draw()
         self.status("Mapa Continental Cargado.")
