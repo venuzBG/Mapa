@@ -14,7 +14,7 @@ from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
 
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon, Point
 
 # =========================
 # RUTAS DEL PROYECTO
@@ -68,18 +68,26 @@ def bilinear_resize(arr: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
     I0, I1 = Ix[y0, :], Ix[y1, :]
     return ((1 - wy)[:, None] * I0 + wy[:, None] * I1).astype(np.float32)
 
-def read_dem_roi_masked(dem_path: str, geojson_path: str, bounds_lonlat: tuple):
+def read_dem_roi_masked(dem_path: str, bounds_lonlat: tuple, mask_geometry=None, mainland_path=BORDER_PATH):
     minx, miny, maxx, maxy = bounds_lonlat
-    mainland = load_ecuador_mainland_geometry(geojson_path)
+    
+    if mask_geometry:
+        clip_geom = mask_geometry
+    else:
+        clip_geom = load_ecuador_mainland_geometry(mainland_path)
+
     with rasterio.open(dem_path) as src:
         win = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
         win = win.round_offsets().round_lengths()
         arr = src.read(1, window=win).astype(np.float32)
         transform = src.window_transform(win)
+        
         if src.nodata is not None: arr[arr == src.nodata] = np.nan
-        if mainland:
-            mask = geometry_mask([mainland], out_shape=arr.shape, transform=transform, invert=True)
+        
+        if clip_geom:
+            mask = geometry_mask([clip_geom], out_shape=arr.shape, transform=transform, invert=True)
             arr[~mask] = np.nan
+            
     return arr, transform
 
 # =========================
@@ -146,14 +154,36 @@ class EcuadorMapVisor(ctk.CTk):
         super().__init__()
         self.title("Visor Ecuador Continental - Grupo 4")
         self.geometry("1400x900")
+        
         self.selected_bounds = None
+        self.selected_geom = None    
+        self.selection_mode = 'rect'
+        
         self.rect_selector = None
+        self.click_cid = None        
+        self.highlight_artist = None 
         self.colorbar = None
         
-        # Variables para resolución
         self.orig_res_x = None
         self.orig_res_y = None
         
+        # --- CARGA INTELIGENTE DE CANTONES ---
+        self.gdf_cantones = None
+        
+        # 1. Intentamos buscar 'cantones.geojson'
+        if os.path.exists(CANTONES_PATH):
+            try:
+                self.gdf_cantones = gpd.read_file(CANTONES_PATH)
+                print("Cantones cargados desde cantones.geojson")
+            except: pass
+        
+        # 2. Si falló, intentamos buscar en 'ecuador.geojson' (Fallback)
+        if self.gdf_cantones is None and os.path.exists(BORDER_PATH):
+            try:
+                self.gdf_cantones = gpd.read_file(BORDER_PATH)
+                print("Cantones cargados desde ecuador.geojson (fallback)")
+            except: pass
+            
         self.setup_ui()
         self.load_full_map()
 
@@ -164,10 +194,8 @@ class EcuadorMapVisor(ctk.CTk):
         self.sidebar = ctk.CTkFrame(self, width=300, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         
-        # --- TÍTULO ---
         ctk.CTkLabel(self.sidebar, text="CONTROLES", font=("Arial", 20, "bold")).pack(pady=(20, 10))
         
-        # --- SECCIÓN DE ESTADÍSTICAS ---
         self.stats_frame = ctk.CTkFrame(self.sidebar, fg_color="#2B2B2B")
         self.stats_frame.pack(fill="x", padx=10, pady=10)
         
@@ -179,7 +207,6 @@ class EcuadorMapVisor(ctk.CTk):
         self.lbl_view_dim = ctk.CTkLabel(self.stats_frame, text="Visor: ...", font=("Consolas", 11))
         self.lbl_view_dim.pack(anchor="w", padx=10)
 
-        # ETIQUETA SELECCIÓN
         self.lbl_sel_dim = ctk.CTkLabel(self.stats_frame, text="Selección: -", font=("Consolas", 11), text_color="#FFCC00")
         self.lbl_sel_dim.pack(anchor="w", padx=10, pady=(5, 5))
 
@@ -189,7 +216,9 @@ class EcuadorMapVisor(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text="Herramientas", font=("Arial", 14, "bold")).pack(pady=(20,10))
         ctk.CTkButton(self.sidebar, text="Zoom", command=self.enable_zoom).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(self.sidebar, text="Mover (Pan)", command=self.enable_pan).pack(pady=5, padx=20, fill="x")
-        ctk.CTkButton(self.sidebar, text="Seleccionar Zona", command=self.enable_rect_select).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(self.sidebar, text="Seleccionar Zona (Rect)", command=self.enable_rect_select).pack(pady=5, padx=20, fill="x")
+        
+        ctk.CTkButton(self.sidebar, text="Seleccionar Cantón (Clic)", command=self.enable_canton_select, fg_color="#238636", hover_color="#2ea043").pack(pady=5, padx=20, fill="x")
         
         ctk.CTkButton(self.sidebar, text="EXPORTAR STL", command=self.export_stl, fg_color="#D00000", hover_color="#800000").pack(pady=30, padx=20, fill="x")
         
@@ -199,7 +228,6 @@ class EcuadorMapVisor(ctk.CTk):
         self.map_frame = ctk.CTkFrame(self, fg_color="#1a1a1a")
         self.map_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         
-        # Figura inicial
         self.fig, self.ax = plt.subplots(figsize=(8,8), facecolor="#1a1a1a")
         self.ax.set_facecolor("black")
         self.ax.tick_params(colors="white")
@@ -213,25 +241,19 @@ class EcuadorMapVisor(ctk.CTk):
     def status(self, txt): self.status_lbl.configure(text=txt)
 
     def load_full_map(self):
-        # 1. Limpiar herramientas
         self.reset_tools()
-        self.rect_selector = None
-        
-        # 2. LIMPIEZA NUCLEAR DE LA FIGURA
-        # Borramos toda la figura (incluyendo ejes deformados) para evitar "deriva"
         self.fig.clear()
-        self.colorbar = None # Olvidamos la colorbar vieja
+        self.colorbar = None
+        self.highlight_artist = None 
 
-        # 3. CREAMOS UN EJE NUEVO LIMPIO (Posición 0,0)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor("black")
         self.ax.tick_params(colors="white")
         self.ax.grid(False)
-        self.ax.set_title("Ecuador Continental (Sin Galápagos)", color="white", fontsize=14)
+        self.ax.set_title("Ecuador Continental ", color="white", fontsize=14)
 
         if not os.path.exists(DEM_LIGERO_PATH): return messagebox.showerror("Error", "Falta DEM (Clipped).")
         
-        # Cargar datos (igual que antes)
         mainland = load_ecuador_mainland_geometry(BORDER_PATH)
         bounds = mainland.bounds if mainland else (-81.5, -5.5, -75.0, 1.5)
         
@@ -244,7 +266,7 @@ class EcuadorMapVisor(ctk.CTk):
                     self.orig_res_y = -src_full.transform[4] 
             except: pass
         
-        arr, transform = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, bounds)
+        arr, transform = read_dem_roi_masked(DEM_LIGERO_PATH, bounds, mainland_path=BORDER_PATH)
         
         if orig_w == 0:
             orig_h = arr.shape[0] * 10
@@ -268,8 +290,13 @@ class EcuadorMapVisor(ctk.CTk):
         img = self.ax.imshow(arr_disp, extent=[bounds[0], bounds[2], bounds[1], bounds[3]], cmap="terrain", origin="upper")
         
         try:
-            f_cant = CANTONES_PATH if os.path.exists(CANTONES_PATH) else BORDER_PATH
-            gpd.read_file(f_cant).boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
+            # Dibujar líneas (intentar usar gdf_cantones si ya está cargado)
+            if self.gdf_cantones is not None:
+                self.gdf_cantones.boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
+            else:
+                f_cant = CANTONES_PATH if os.path.exists(CANTONES_PATH) else BORDER_PATH
+                gpd.read_file(f_cant).boundary.plot(ax=self.ax, linewidth=0.3, color="white", alpha=0.4)
+                
             if os.path.exists(PROVINCES_PATH): gpd.read_file(PROVINCES_PATH).boundary.plot(ax=self.ax, linewidth=0.8, color="white", alpha=0.8)
             if mainland: gpd.GeoSeries([mainland]).boundary.plot(ax=self.ax, linewidth=2.0, color="#00E5FF")
         except: pass
@@ -282,9 +309,7 @@ class EcuadorMapVisor(ctk.CTk):
         self.colorbar.ax.yaxis.set_tick_params(color="white", labelcolor="white")
         self.colorbar.outline.set_edgecolor('white')
 
-        # FIX DE CENTRADO (Ahora sí funcionará perfecto porque la figura es nueva)
         self.fig.tight_layout()
-
         self.canvas.draw()
         self.status("Mapa Continental Cargado.")
 
@@ -294,11 +319,23 @@ class EcuadorMapVisor(ctk.CTk):
         
         if self.rect_selector:
             self.rect_selector.set_active(False)
+            try: self.rect_selector.set_visible(False)
+            except: pass
+            self.canvas.draw_idle()
+
+        if self.click_cid:
+            self.canvas.mpl_disconnect(self.click_cid)
+            self.click_cid = None
+            
+        if self.highlight_artist:
             try:
-                self.rect_selector.set_visible(False)
+                self.highlight_artist.remove()
+                self.highlight_artist = None
+                self.canvas.draw_idle()
             except: pass
             
-            self.canvas.draw_idle()
+        self.selected_bounds = None
+        self.selected_geom = None
 
     def enable_zoom(self):
         self.reset_tools()
@@ -312,26 +349,72 @@ class EcuadorMapVisor(ctk.CTk):
 
     def enable_rect_select(self):
         self.reset_tools()
+        self.selection_mode = 'rect'
         
         def onselect(eclick, erelease):
             x1, y1, x2, y2 = eclick.xdata, eclick.ydata, erelease.xdata, erelease.ydata
-            
             minx, maxx = sorted([x1, x2])
             miny, maxy = sorted([y1, y2])
             self.selected_bounds = (minx, miny, maxx, maxy)
+            self.selected_geom = None 
             
             if self.orig_res_x and self.orig_res_y:
-                width_deg = maxx - minx
-                height_deg = maxy - miny
-                px_w = int(width_deg / self.orig_res_x)
-                px_h = int(height_deg / self.orig_res_y)
+                px_w = int((maxx - minx) / self.orig_res_x)
+                px_h = int((maxy - miny) / self.orig_res_y)
                 self.lbl_sel_dim.configure(text=f"Selección: {px_w} x {px_h} px")
             
-            self.status("Zona seleccionada.")
+            self.status("Zona Rectangular Seleccionada.")
             
         self.rect_selector = RectangleSelector(self.ax, onselect, useblit=True, button=[1], interactive=True)
         self.rect_selector.set_active(True)
-        self.status("Herramienta: Selección activa.")
+        self.status("Herramienta: Selección Rectangular.")
+
+    def enable_canton_select(self):
+        self.reset_tools()
+        self.selection_mode = 'canton'
+        
+        if self.gdf_cantones is None:
+            messagebox.showerror("Error", "No se encontró información de cantones en data/ (ni ecuador.geojson ni cantones.geojson).")
+            return
+
+        self.click_cid = self.canvas.mpl_connect('button_press_event', self.on_canton_click)
+        self.status("Herramienta: Clic en un Cantón para seleccionar.")
+
+    def on_canton_click(self, event):
+        if event.inaxes != self.ax: return
+        if self.toolbar.mode != '': return 
+        
+        x, y = event.xdata, event.ydata
+        pt = Point(x, y)
+        
+        matches = self.gdf_cantones[self.gdf_cantones.contains(pt)]
+        
+        if not matches.empty:
+            canton = matches.iloc[0] 
+            
+            self.selected_geom = canton.geometry
+            self.selected_bounds = canton.geometry.bounds
+            
+            if self.highlight_artist: 
+                try: self.highlight_artist.remove() 
+                except: pass
+            
+            plot_res = gpd.GeoSeries([canton.geometry]).plot(ax=self.ax, color='yellow', alpha=0.4, edgecolor='yellow', linewidth=2)
+            self.highlight_artist = self.ax.collections[-1] 
+            self.canvas.draw()
+            
+            minx, miny, maxx, maxy = self.selected_bounds
+            if self.orig_res_x:
+                px_w = int((maxx - minx) / self.orig_res_x)
+                px_h = int((maxy - miny) / self.orig_res_y)
+                # Intentamos obtener un nombre del cantón
+                # Común: 'DPA_DESCAN', 'NAM', 'name', etc. Ajusta según tu GeoJSON.
+                name = getattr(canton, 'DPA_DESCAN', 'Cantón') 
+                self.lbl_sel_dim.configure(text=f"{name}: {px_w} x {px_h} px")
+            
+            self.status(f"Cantón Seleccionado.")
+        else:
+            self.status("Clic fuera de cantones conocidos.")
 
     def export_stl(self):
         if not self.selected_bounds: return messagebox.showwarning("!", "Selecciona una zona primero.")
@@ -345,7 +428,9 @@ class EcuadorMapVisor(ctk.CTk):
         self.status("Generando STL...")
         self.update_idletasks()
         try:
-            arr, _ = read_dem_roi_masked(DEM_LIGERO_PATH, BORDER_PATH, self.selected_bounds)
+            mask_poly = self.selected_geom if self.selection_mode == 'canton' else None
+            arr, _ = read_dem_roi_masked(DEM_LIGERO_PATH, self.selected_bounds, mask_geometry=mask_poly, mainland_path=BORDER_PATH)
+            
             arr_filled = np.nan_to_num(arr, nan=np.nanmin(arr))
             scale = max(arr_filled.shape) / dlg.result["target"]
             h, w = arr_filled.shape
